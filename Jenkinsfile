@@ -2,101 +2,103 @@ pipeline {
     agent any
     
     environment {
-        DOCKERHUB_USERNAME = 'mohamedkhaled55'
-        DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
-        GITHUB_REPO = 'https://github.com/mohamed-55-iti/deploy-tier-application-backend-Database-proxy-.git'
         PATH = "/var/jenkins_home/bin:${env.PATH}"
+        OPENSHIFT_SERVER = 'https://api.crc.testing:6443'
+        WEBAPP_NAMESPACE = 'webapp'
     }
     
     stages {
         stage('Checkout') {
             steps {
-                echo "Cloning repository..."
+                echo "Cloning repository from GitHub..."
                 git branch: 'Master', 
-                    url: "${GITHUB_REPO}"
-                sh 'ls -la'
+                    url: 'https://github.com/mohamed-55-iti/deploy-tier-application-backend-Database-proxy-.git'
+                
+                sh '''
+                    echo "=== Repository Contents ==="
+                    ls -la
+                    echo ""
+                    echo "=== Files structure ==="
+                    find . -type f -name "*.go" -o -name "Dockerfile" -o -name "*.conf"
+                '''
             }
         }
         
-        stage('Build Backend Image') {
+        stage('Build Images with OpenShift') {
             steps {
                 script {
-                    echo "Building Backend image..."
+                    echo "Building images using OpenShift BuildConfig..."
                     sh '''
-                        docker build -t ${DOCKERHUB_USERNAME}/backend:${BUILD_NUMBER} -f Dockerfile .
-                        docker tag ${DOCKERHUB_USERNAME}/backend:${BUILD_NUMBER} ${DOCKERHUB_USERNAME}/backend:latest
-                    '''
-                }
-            }
-        }
-        
-        stage('Build Nginx Proxy Image') {
-            steps {
-                script {
-                    echo "Building Nginx Proxy image..."
-                    sh '''
-                        # إنشاء Dockerfile للـ Nginx
-                        cat > nginx/Dockerfile << 'NGEOF'
-FROM nginx:alpine
-COPY default.conf /etc/nginx/conf.d/default.conf
-EXPOSE 80 443
-CMD ["nginx", "-g", "daemon off;"]
-NGEOF
+                        echo "=== Starting Backend Build ==="
+                        /var/jenkins_home/bin/oc start-build backend-build -n ${WEBAPP_NAMESPACE} --follow --wait || echo "Backend build failed"
                         
-                        docker build -t ${DOCKERHUB_USERNAME}/proxy:${BUILD_NUMBER} nginx/
-                        docker tag ${DOCKERHUB_USERNAME}/proxy:${BUILD_NUMBER} ${DOCKERHUB_USERNAME}/proxy:latest
+                        echo ""
+                        echo "=== Starting Proxy Build ==="
+                        /var/jenkins_home/bin/oc start-build proxy-build -n ${WEBAPP_NAMESPACE} --follow --wait || echo "Proxy build failed"
+                        
+                        echo ""
+                        echo "=== Build Status ==="
+                        /var/jenkins_home/bin/oc get builds -n ${WEBAPP_NAMESPACE}
                     '''
                 }
             }
         }
         
-        stage('Push Images to DockerHub') {
+        stage('Update Deployments') {
             steps {
                 script {
-                    echo "Pushing images to DockerHub..."
+                    echo "Updating deployments to use new images..."
                     sh '''
-                        echo ${DOCKERHUB_CREDENTIALS_PSW} | docker login -u ${DOCKERHUB_CREDENTIALS_USR} --password-stdin
-                        docker push ${DOCKERHUB_USERNAME}/backend:${BUILD_NUMBER}
-                        docker push ${DOCKERHUB_USERNAME}/backend:latest
-                        docker push ${DOCKERHUB_USERNAME}/proxy:${BUILD_NUMBER}
-                        docker push ${DOCKERHUB_USERNAME}/proxy:latest
+                        # Update backend deployment to use new image
+                        /var/jenkins_home/bin/oc set image deployment/backend \
+                            backend=image-registry.openshift-image-registry.svc:5000/${WEBAPP_NAMESPACE}/backend:latest \
+                            -n ${WEBAPP_NAMESPACE} || echo "Backend update failed"
+                        
+                        # Update proxy deployment to use new image
+                        /var/jenkins_home/bin/oc set image deployment/proxy-deployment \
+                            proxy=image-registry.openshift-image-registry.svc:5000/${WEBAPP_NAMESPACE}/proxy:latest \
+                            -n ${WEBAPP_NAMESPACE} || echo "Proxy update failed"
                     '''
                 }
             }
         }
         
-        stage('Deploy to OpenShift') {
-            steps {
-                script {
-                    echo "Deploying to webapp namespace..."
-                    sh '''
-                        # Update backend deployment
-                        /var/jenkins_home/bin/oc set image deployment/backend backend=${DOCKERHUB_USERNAME}/backend:${BUILD_NUMBER} -n webapp || echo "Backend deployment not found"
-                        
-                        # Update proxy deployment
-                        /var/jenkins_home/bin/oc set image deployment/proxy-deployment proxy=${DOCKERHUB_USERNAME}/proxy:${BUILD_NUMBER} -n webapp || echo "Proxy deployment not found"
-                        
-                        # Wait for rollout
-                        /var/jenkins_home/bin/oc rollout status deployment/backend -n webapp --timeout=300s || echo "Backend rollout timeout"
-                        /var/jenkins_home/bin/oc rollout status deployment/proxy-deployment -n webapp --timeout=300s || echo "Proxy rollout timeout"
-                    '''
-                }
-            }
-        }
-        
-        stage('Verify Deployment') {
+        stage('Rollout & Verify') {
             steps {
                 sh '''
-                    echo "=== Checking Pods Status ==="
-                    /var/jenkins_home/bin/oc get pods -n webapp
+                    echo "=== Rolling out new deployments ==="
+                    /var/jenkins_home/bin/oc rollout status deployment/backend -n ${WEBAPP_NAMESPACE} --timeout=300s || echo "Backend rollout timeout"
+                    /var/jenkins_home/bin/oc rollout status deployment/proxy-deployment -n ${WEBAPP_NAMESPACE} --timeout=300s || echo "Proxy rollout timeout"
                     
                     echo ""
-                    echo "=== Checking Services ==="
-                    /var/jenkins_home/bin/oc get svc -n webapp
+                    echo "=== Current Pods Status ==="
+                    /var/jenkins_home/bin/oc get pods -n ${WEBAPP_NAMESPACE}
                     
                     echo ""
-                    echo "=== Checking Routes ==="
-                    /var/jenkins_home/bin/oc get routes -n webapp
+                    echo "=== Services ==="
+                    /var/jenkins_home/bin/oc get svc -n ${WEBAPP_NAMESPACE}
+                    
+                    echo ""
+                    echo "=== Routes ==="
+                    /var/jenkins_home/bin/oc get routes -n ${WEBAPP_NAMESPACE}
+                '''
+            }
+        }
+        
+        stage('Smoke Test') {
+            steps {
+                sh '''
+                    echo "=== Running Smoke Tests ==="
+                    
+                    # Test Backend
+                    echo "Testing Backend..."
+                    /var/jenkins_home/bin/oc exec -n ${WEBAPP_NAMESPACE} deployment/backend -- curl -s localhost:8000/ || echo "Backend test failed"
+                    
+                    # Test Proxy
+                    echo ""
+                    echo "Testing Proxy..."
+                    PROXY_URL=$(/var/jenkins_home/bin/oc get route proxy-route -n ${WEBAPP_NAMESPACE} -o jsonpath='{.spec.host}')
+                    curl -k https://${PROXY_URL} || echo "Proxy test failed"
                 '''
             }
         }
@@ -106,14 +108,18 @@ NGEOF
         success {
             echo "✅ CI/CD Pipeline completed successfully!"
             echo "Build Number: ${BUILD_NUMBER}"
-            echo "Backend Image: ${DOCKERHUB_USERNAME}/backend:${BUILD_NUMBER}"
-            echo "Proxy Image: ${DOCKERHUB_USERNAME}/proxy:${BUILD_NUMBER}"
+            sh '''
+                echo ""
+                echo "=== Application URLs ==="
+                /var/jenkins_home/bin/oc get routes -n ${WEBAPP_NAMESPACE} -o custom-columns=NAME:.metadata.name,URL:.spec.host
+            '''
         }
         failure {
             echo "❌ Pipeline failed!"
-        }
-        always {
-            sh 'docker logout || true'
+            sh '''
+                echo "=== Recent Events ==="
+                /var/jenkins_home/bin/oc get events -n ${WEBAPP_NAMESPACE} --sort-by='.lastTimestamp' | tail -10
+            '''
         }
     }
 }
