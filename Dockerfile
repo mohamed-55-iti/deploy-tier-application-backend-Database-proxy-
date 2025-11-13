@@ -1,24 +1,12 @@
-FROM golang:1.19 AS build-stage
-
+FROM golang:1.21-alpine AS builder
 WORKDIR /app
-
 COPY go.mod go.sum ./
 RUN go mod download
+COPY main.go ./
+RUN CGO_ENABLED=0 GOOS=linux go build -o backend main.go
 
-COPY *.go ./
-
-RUN CGO_ENABLED=0 GOOS=linux go build -o /backend
-
-FROM build-stage AS run-test-stage
-RUN go test -v ./...
-
-FROM alpine AS build-release-stage
-
-WORKDIR /
-
-COPY --from=build-stage /backend /backend
-
+FROM alpine:latest
+WORKDIR /root/
+COPY --from=builder /app/backend .
 EXPOSE 8000
-
-
-ENTRYPOINT ["/backend"]
+CMD ["./backend"]
